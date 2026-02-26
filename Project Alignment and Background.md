@@ -4,6 +4,12 @@ The objective is to build a **Peer-to-Peer (P2P) file-sharing software** similar
 
 ---
 
+
+# Work Breakdown
+- Jason - Bringing things together in `PeerProcess.py`
+- Nick - Networking module (new file `networking.py`)
+- Alex - Working on `protocol.py`
+
 ## Common Pitfalls
 
 ### 1. Protocol Deviations
