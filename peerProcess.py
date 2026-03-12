@@ -1,5 +1,6 @@
 import argparse
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -120,6 +121,13 @@ def main():
         if p.peer_id == self_info.peer_id:
             break
         net.connect_to_peer(p.peer_id, p.host, p.port)
+
+    # Keep the main thread alive so daemon threads stay running
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        net.shutdown()
 
 
 if __name__ == "__main__":
