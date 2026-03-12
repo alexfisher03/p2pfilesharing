@@ -36,14 +36,6 @@ def main():
             "Check that the peer ID matches an entry in the config file."
         )
 
-    # TODO: open server socket on self port
-    # TODO: connect to all predecessor peers
-    # TODO: exchange handshake then bitfield
-    # TODO: message receive loop
-    # TODO: choking/unchoking scheduler
-    # TODO: request/piece handling
-    # TODO: completion detection and shutdown
-
     _ = common  # silence unused for now
 
 
