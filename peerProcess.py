@@ -234,7 +234,7 @@ class PeerSession:
         if new_preferred:
             ids = ",".join(str(pid) for pid in sorted(new_preferred))
             self.logger.write(
-                f"Peer {self.self_info.peer_id} has the preferred neighbors {ids}."
+                f"Peer {self.self_info.peer_id} has the preferred neighbors [{ids}]."
             )
 
     def _unchoke_loop(self) -> None:
@@ -344,6 +344,8 @@ class PeerSession:
             nbr.bitfield[:length] = message.payload[:length]
             # Decide if we're interested based on what they have
             self.update_interest(remote_id, nbr)
+            # covers the case where both peers already have the file (no HAVE/PIECE ever fires)
+            self._check_termination()
 
         elif mtype == protocol.MessageType.REQUEST:
             # They want a piece from us — only serve it if we are currently unchoking them
