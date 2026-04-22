@@ -1,5 +1,6 @@
 import socket
 import threading
+import time
 import protocol
 
 class NetworkManager:
@@ -56,21 +57,27 @@ class NetworkManager:
         t.start()
 
     # called when WE connect to someone -- we send handshake first
-    def connect_to_peer(self, remote_peer_id, host, port):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.connect((host, port))
-            sock.sendall(protocol.make_handshake(self.self_peer_id))
-            protocol.recv_handshake(sock)
-        except Exception as e:
-            print(f"failed to connect to peer {remote_peer_id}: {e}")
-            sock.close()
+    def connect_to_peer(self, remote_peer_id, host, port, retries=5, delay=1):
+        for attempt in range(retries):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.connect((host, port))
+                sock.sendall(protocol.make_handshake(self.self_peer_id))
+                protocol.recv_handshake(sock)
+            except Exception as e:
+                sock.close()
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                    continue
+                # out of retries
+                print(f"failed to connect to peer {remote_peer_id} after {retries} attempts: {e}")
+                return
+            lock = threading.Lock()
+            self.connections[remote_peer_id] = (sock, lock)
+            self.on_connected(remote_peer_id, incoming=False)
+            t = threading.Thread(target=self._listen_loop, args=(remote_peer_id, sock), daemon=True)
+            t.start()
             return
-        lock = threading.Lock()
-        self.connections[remote_peer_id] = (sock, lock)
-        self.on_connected(remote_peer_id, incoming=False)
-        t = threading.Thread(target=self._listen_loop, args=(remote_peer_id, sock), daemon=True)
-        t.start()
 
     # one of these runs per connected peer — blocks waiting for messages
     def _listen_loop(self, remote_peer_id, sock):

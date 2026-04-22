@@ -59,6 +59,12 @@ class PeerSession:
         # only one thread touches them at a time so we dont end up with corrupted state
         self._state_lock = threading.Lock()
 
+        self.preferred_neighbors: set[int] = set()
+        self.optimistic_peer: int | None = None  # set by optimistic unchoke loop (step 4)
+
+        # main thread waits on this -- set it when everyone is done to trigger clean exit
+        self._done_event = threading.Event()
+
         self.net: networking.NetworkManager | None = None
 
     # ----- file helpers -----
@@ -159,6 +165,19 @@ class PeerSession:
             ),
         )
 
+    # ----- termination -----
+
+    def _check_termination(self) -> None:
+        # bail early if we dont have everything yet
+        with self._state_lock:
+            if self.count_pieces() < self.num_pieces:
+                return
+        # check every connected neighbor -- if any still missing a piece we're not done
+        for nbr in list(self.neighbors.values()):
+            if not all(self.neighbor_has_piece(nbr, i) for i in range(self.num_pieces)):
+                return
+        self._done_event.set()
+
     # ----- rate tracking -----
 
     def _snapshot_rates(self) -> None:
@@ -171,10 +190,99 @@ class PeerSession:
                 nbr.download_rate = nbr.bytes_downloaded_from / interval
                 nbr.bytes_downloaded_from = 0
 
-    def _rate_snapshot_loop(self) -> None:
+    def _update_preferred_neighbors(self) -> None:
+        k = self.common.num_pref_neighbors
+
+        # only neighbors that are actually interested in getting pieces from us
+        interested = [nbr for nbr in list(self.neighbors.values()) if nbr.peer_interested]
+
+        with self._state_lock:
+            has_full_file = self.count_pieces() == self.num_pieces
+
+        if has_full_file:
+            # we're a seeder so rates dont matter -- just pick randomly
+            chosen = random.sample(interested, min(k, len(interested)))
+        else:
+            # top-k by download rate, random secondary sort breaks ties
+            chosen = sorted(
+                interested,
+                key=lambda n: (n.download_rate, random.random()),
+                reverse=True,
+            )[:k]
+
+        new_preferred = {nbr.peer_id for nbr in chosen}
+        old_preferred = self.preferred_neighbors
+
+        # choke anyone who dropped out of preferred (unless they're the optimistic pick)
+        for pid in old_preferred - new_preferred:
+            if pid == self.optimistic_peer:
+                continue
+            nbr = self.neighbors.get(pid)
+            if nbr and not nbr.am_choking:
+                nbr.am_choking = True
+                self.net.send_message(pid, protocol.Message(protocol.MessageType.CHOKE))
+
+        # unchoke anyone newly added to preferred
+        for pid in new_preferred - old_preferred:
+            nbr = self.neighbors.get(pid)
+            if nbr and nbr.am_choking:
+                nbr.am_choking = False
+                self.net.send_message(pid, protocol.Message(protocol.MessageType.UNCHOKE))
+
+        self.preferred_neighbors = new_preferred
+
+        if new_preferred:
+            ids = ",".join(str(pid) for pid in sorted(new_preferred))
+            self.logger.write(
+                f"Peer {self.self_info.peer_id} has the preferred neighbors {ids}."
+            )
+
+    def _unchoke_loop(self) -> None:
+        # snapshot rates first so the decision always uses fresh numbers, then pick neighbors
         while not self.net._shutdown.is_set():
             time.sleep(self.common.unchoke_interval)
             self._snapshot_rates()
+            self._update_preferred_neighbors()
+
+    def _update_optimistic_unchoke(self) -> None:
+        # candidates are neighbors we're choking AND who are interested in us
+        # (excludes already-preferred neighbors since they're already unchoked)
+        candidates = [
+            nbr for nbr in list(self.neighbors.values())
+            if nbr.am_choking and nbr.peer_interested
+        ]
+
+        old_optimistic = self.optimistic_peer
+
+        if candidates:
+            new_optimistic = random.choice(candidates).peer_id
+        else:
+            new_optimistic = None
+
+        # choke the previous optimistic pick if they arent in preferred anymore
+        if old_optimistic is not None and old_optimistic != new_optimistic:
+            if old_optimistic not in self.preferred_neighbors:
+                nbr = self.neighbors.get(old_optimistic)
+                if nbr and not nbr.am_choking:
+                    nbr.am_choking = True
+                    self.net.send_message(old_optimistic, protocol.Message(protocol.MessageType.CHOKE))
+
+        # unchoke the new pick
+        if new_optimistic is not None:
+            nbr = self.neighbors.get(new_optimistic)
+            if nbr and nbr.am_choking:
+                nbr.am_choking = False
+                self.net.send_message(new_optimistic, protocol.Message(protocol.MessageType.UNCHOKE))
+            self.logger.write(
+                f"Peer {self.self_info.peer_id} has the optimistically unchoked neighbor {new_optimistic}."
+            )
+
+        self.optimistic_peer = new_optimistic
+
+    def _optimistic_loop(self) -> None:
+        while not self.net._shutdown.is_set():
+            time.sleep(self.common.optimistic_interval)
+            self._update_optimistic_unchoke()
 
     # ----- message / connection callbacks -----
 
@@ -228,6 +336,7 @@ class PeerSession:
             )
             # They may now have something we want
             self.update_interest(remote_id, nbr)
+            self._check_termination()
 
         elif mtype == protocol.MessageType.BITFIELD:
             # First message after handshake — replace their all-zero placeholder with reality
@@ -288,6 +397,8 @@ class PeerSession:
             for nid, n in list(self.neighbors.items()):
                 self.update_interest(nid, n)
 
+            self._check_termination()
+
             # Keep the pipeline going — ask for the next piece if still unchoked
             if not nbr.peer_choking:
                 self.maybe_request(remote_id, nbr)
@@ -338,7 +449,8 @@ class PeerSession:
 
         self.net.start_server()
 
-        threading.Thread(target=self._rate_snapshot_loop, daemon=True).start()
+        threading.Thread(target=self._unchoke_loop, daemon=True).start()
+        threading.Thread(target=self._optimistic_loop, daemon=True).start()
 
         # Connect to all peers listed above us in PeerInfo.cfg
         for p in self.peers:
@@ -346,10 +458,10 @@ class PeerSession:
                 break
             self.net.connect_to_peer(p.peer_id, p.host, p.port)
 
-        # Keep the main thread alive so daemon threads stay running
+        # block here until either everyone is done or the user hits ctrl-c
         try:
-            while True:
-                time.sleep(1)
+            self._done_event.wait()
+            self.net.shutdown()
         except KeyboardInterrupt:
             self.net.shutdown()
 
