@@ -1,6 +1,7 @@
 import argparse
 import math
 import random
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,11 @@ class PeerSession:
         # Piece indices currently requested across all neighbors — avoids requesting
         # the same piece from two peers at once (spec: "has not requested from other neighbors")
         self.in_flight_requests: set[int] = set()
+
+        # one thread runs per peer connection so own_bitfield and in_flight_requests
+        # can get hit from multiple threads at the same time -- this lock makes sure
+        # only one thread touches them at a time so we dont end up with corrupted state
+        self._state_lock = threading.Lock()
 
         self.net: networking.NetworkManager | None = None
 
@@ -131,18 +137,20 @@ class PeerSession:
 
     def maybe_request(self, remote_id: int, nbr: NeighborState) -> None:
         # Pick a random piece the neighbor has that we need and haven't requested yet
-        candidates = [
-            i
-            for i in range(self.num_pieces)
-            if not self.has_piece(i)
-            and self.neighbor_has_piece(nbr, i)
-            and i not in self.in_flight_requests
-        ]
-        if not candidates:
-            return
-        piece_index = random.choice(candidates)
-        nbr.requested_piece = piece_index
-        self.in_flight_requests.add(piece_index)
+        # hold the lock for the whole check + add so two threads cant pick the same piece
+        with self._state_lock:
+            candidates = [
+                i
+                for i in range(self.num_pieces)
+                if not self.has_piece(i)
+                and self.neighbor_has_piece(nbr, i)
+                and i not in self.in_flight_requests
+            ]
+            if not candidates:
+                return
+            piece_index = random.choice(candidates)
+            nbr.requested_piece = piece_index
+            self.in_flight_requests.add(piece_index)
         self.net.send_message(
             remote_id,
             protocol.Message(
@@ -150,6 +158,23 @@ class PeerSession:
                 payload=protocol.pack_piece_index(piece_index),
             ),
         )
+
+    # ----- rate tracking -----
+
+    def _snapshot_rates(self) -> None:
+        # called every unchoke_interval seconds -- capture how many bytes we downloaded
+        # from each neighbor during that window, convert to bytes/sec, then reset the
+        # counter so the next interval starts fresh
+        interval = self.common.unchoke_interval
+        with self._state_lock:
+            for nbr in self.neighbors.values():
+                nbr.download_rate = nbr.bytes_downloaded_from / interval
+                nbr.bytes_downloaded_from = 0
+
+    def _rate_snapshot_loop(self) -> None:
+        while not self.net._shutdown.is_set():
+            time.sleep(self.common.unchoke_interval)
+            self._snapshot_rates()
 
     # ----- message / connection callbacks -----
 
@@ -163,9 +188,10 @@ class PeerSession:
         if mtype == protocol.MessageType.CHOKE:
             # They are now choking us, cancel our in-flight request since no piece is coming
             nbr.peer_choking = True
-            if nbr.requested_piece is not None:
-                self.in_flight_requests.discard(nbr.requested_piece)
-                nbr.requested_piece = None
+            with self._state_lock:
+                if nbr.requested_piece is not None:
+                    self.in_flight_requests.discard(nbr.requested_piece)
+                    nbr.requested_piece = None
             self.logger.write(
                 f"Peer {self.self_info.peer_id} is choked by {remote_id}."
             )
@@ -228,16 +254,16 @@ class PeerSession:
         elif mtype == protocol.MessageType.PIECE:
             piece_index, piece_data = protocol.unpack_piece(message.payload)
 
-            # Request is fulfilled — remove it from in-flight tracking
-            self.in_flight_requests.discard(piece_index)
-            nbr.requested_piece = None
-            nbr.bytes_downloaded_from += len(piece_data)
-
-            # Save the piece to disk and flip our bitfield bit
+            # write to disk first before we tell anyone we have it
             self.write_piece(piece_index, piece_data)
-            self.own_bitfield[piece_index // 8] |= 1 << (7 - (piece_index % 8))
 
-            piece_count = self.count_pieces()
+            # now lock to update the two shared structures together atomically
+            with self._state_lock:
+                self.in_flight_requests.discard(piece_index)
+                nbr.requested_piece = None
+                nbr.bytes_downloaded_from += len(piece_data)
+                self.own_bitfield[piece_index // 8] |= 1 << (7 - (piece_index % 8))
+                piece_count = self.count_pieces()
             self.logger.write(
                 f"Peer {self.self_info.peer_id} has downloaded the piece {piece_index} from {remote_id}. "
                 f"Now the number of pieces it has is {piece_count}."
@@ -311,6 +337,8 @@ class PeerSession:
         )
 
         self.net.start_server()
+
+        threading.Thread(target=self._rate_snapshot_loop, daemon=True).start()
 
         # Connect to all peers listed above us in PeerInfo.cfg
         for p in self.peers:
