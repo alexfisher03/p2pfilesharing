@@ -108,6 +108,10 @@ class PeerSession:
     # bitfield helpers ---
 
     def has_piece(self, idx: int) -> bool:
+        # bitfield packs 8 pieces per byte. piece idx lives in byte (idx//8),
+        # at bit position (7 - idx%8), we count from the MSB so piece 0 is the
+        # leftmost bit of byte 0, piece 1 is the next bit over, etc .
+        # build a mask with just that one bit set, AND it with the byte , nonzero = we have it.
         return bool(self.own_bitfield[idx // 8] & (1 << (7 - (idx % 8))))
 
     def neighbor_has_piece(self, nbr: NeighborState, idx: int) -> bool:
@@ -449,7 +453,7 @@ class PeerSession:
                 ),
             )
 
-    # ----- main loop -----
+    # ---- main loop
 
     def run(self) -> None:
         self.net = networking.NetworkManager(
