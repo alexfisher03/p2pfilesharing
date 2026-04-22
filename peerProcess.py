@@ -72,8 +72,7 @@ class PeerSession:
     # file helpers -----
 
     def peer_dir(self) -> Path:
-        # Each peer keeps its files in peer_<id>/ under the working directory
-        d = self.workdir / f"peer_{self.self_info.peer_id}"
+        d = self.workdir / str(self.self_info.peer_id)
         d.mkdir(exist_ok=True)
         return d
 
@@ -97,13 +96,21 @@ class PeerSession:
         (self.peer_dir() / f"piece_{piece_index}").write_bytes(data)
 
     def assemble_file(self) -> None:
-        # concatenate every piece file into the final file in order
+        # write to a temp file first -- if we opened the real output file directly,
+        # read_piece would see it exist (even while empty) and read 0 bytes from it
+        tmp_path = self.peer_dir() / (self.common.file_name + ".tmp")
         out_path = self.peer_dir() / self.common.file_name
-        with out_path.open("wb") as f:
+        with tmp_path.open("wb") as f:
             for i in range(self.num_pieces):
                 data = self.read_piece(i)
                 if data:
                     f.write(data)
+        tmp_path.rename(out_path)
+        # clean up individual piece files now that the full file is assembled
+        for i in range(self.num_pieces):
+            p = self.peer_dir() / f"piece_{i}"
+            if p.exists():
+                p.unlink()
 
     # bitfield helpers ---
 
