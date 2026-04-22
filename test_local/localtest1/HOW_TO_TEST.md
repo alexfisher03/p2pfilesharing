@@ -4,9 +4,9 @@
 
 - `Common.cfg` — 100 KB file, 16 KB pieces (7 pieces total), 5s unchoke interval
 - `PeerInfo.cfg` — 3 peers all on localhost, ports 7001/7002/7003
-- `peer_1001/testfile.dat` — the complete 100 KB file (peer 1001 starts with it)
-- `peer_1002/` — empty, must download
-- `peer_1003/` — empty, must download
+- `1001/testfile.dat` — the complete 100 KB file (peer 1001 starts with it)
+- `1002/` — empty, must download
+- `1003/` — empty, must download
 
 ## How to run
 
@@ -45,7 +45,7 @@ All three hashes should be identical.
 ## Cleanup between runs
 
 ```bash
-rm -f peer_1002/testfile.dat peer_1003/testfile.dat log_peer_*.log
+rm -f 1002/testfile.dat 1002/piece_* 1003/testfile.dat 1003/piece_* log_peer_*.log
 ```
 
 ## Config notes

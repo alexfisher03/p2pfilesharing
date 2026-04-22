@@ -1,6 +1,7 @@
 import argparse
 import math
 import random
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +36,7 @@ class PeerSession:
         self.logger = logger
 
         self.num_pieces = math.ceil(common.file_size / common.piece_size)
-        # 8 pieces per byte, round up so the last byte covers any remainder.
+        # 8 pieces per byte rounded up so the last byte covers any remainder.
         self.bitfield_len = math.ceil(self.num_pieces / 8)
 
         if self_info.has_file:
@@ -46,20 +47,32 @@ class PeerSession:
         else:
             self.own_bitfield = bytearray(self.bitfield_len)
 
-        # peer_id -> NeighborState for every peer we will talk to
+        # peer_id  - > NeighborState for every peer we will talk to
         self.neighbors: dict[int, NeighborState] = {}
 
         # Piece indices currently requested across all neighbors — avoids requesting
-        # the same piece from two peers at once (spec: "has not requested from other neighbors")
+        # the same piece from two peers at once spec: "has not requested from other neighbors"
         self.in_flight_requests: set[int] = set()
+
+        # one thread runs per peer connection so own_bitfield and in_flight_requests
+        # can get hit from multiple threads at the same time, this lock makes sure
+        # only one thread touches them at a time so we dont end up with corrupted state
+        self._state_lock = threading.Lock()
+
+        self.preferred_neighbors: set[int] = set()
+        self.optimistic_peer: int | None = (
+            None  # set by optimistic unchoke loop (step 4)
+        )
+
+        # main thread waits on this, set it when everyone is done to trigger clean exit
+        self._done_event = threading.Event()
 
         self.net: networking.NetworkManager | None = None
 
-    # ----- file helpers -----
+    # file helpers -----
 
     def peer_dir(self) -> Path:
-        # Each peer keeps its files in peer_<id>/ under the working directory
-        d = self.workdir / f"peer_{self.self_info.peer_id}"
+        d = self.workdir / str(self.self_info.peer_id)
         d.mkdir(exist_ok=True)
         return d
 
@@ -83,17 +96,29 @@ class PeerSession:
         (self.peer_dir() / f"piece_{piece_index}").write_bytes(data)
 
     def assemble_file(self) -> None:
-        # Concatenate every piece file into the final file in order
+        # write to a temp file first -- if we opened the real output file directly,
+        # read_piece would see it exist (even while empty) and read 0 bytes from it
+        tmp_path = self.peer_dir() / (self.common.file_name + ".tmp")
         out_path = self.peer_dir() / self.common.file_name
-        with out_path.open("wb") as f:
+        with tmp_path.open("wb") as f:
             for i in range(self.num_pieces):
                 data = self.read_piece(i)
                 if data:
                     f.write(data)
+        tmp_path.rename(out_path)
+        # clean up individual piece files now that the full file is assembled
+        for i in range(self.num_pieces):
+            p = self.peer_dir() / f"piece_{i}"
+            if p.exists():
+                p.unlink()
 
-    # ----- bitfield helpers -----
+    # bitfield helpers ---
 
     def has_piece(self, idx: int) -> bool:
+        # bitfield packs 8 pieces per byte. piece idx lives in byte (idx//8),
+        # at bit position (7 - idx%8), we count from the MSB so piece 0 is the
+        # leftmost bit of byte 0, piece 1 is the next bit over, etc .
+        # build a mask with just that one bit set, AND it with the byte , nonzero = we have it.
         return bool(self.own_bitfield[idx // 8] & (1 << (7 - (idx % 8))))
 
     def neighbor_has_piece(self, nbr: NeighborState, idx: int) -> bool:
@@ -104,7 +129,7 @@ class PeerSession:
     def count_pieces(self) -> int:
         return sum(1 for i in range(self.num_pieces) if self.has_piece(i))
 
-    # ----- interest helpers -----
+    # interest helpers ----
 
     def has_interesting_pieces(self, nbr: NeighborState) -> bool:
         # True if the neighbor has at least one piece we still need
@@ -127,22 +152,24 @@ class PeerSession:
                 remote_id, protocol.Message(protocol.MessageType.NOT_INTERESTED)
             )
 
-    # ----- request helper -----
+    # request helper ----
 
     def maybe_request(self, remote_id: int, nbr: NeighborState) -> None:
         # Pick a random piece the neighbor has that we need and haven't requested yet
-        candidates = [
-            i
-            for i in range(self.num_pieces)
-            if not self.has_piece(i)
-            and self.neighbor_has_piece(nbr, i)
-            and i not in self.in_flight_requests
-        ]
-        if not candidates:
-            return
-        piece_index = random.choice(candidates)
-        nbr.requested_piece = piece_index
-        self.in_flight_requests.add(piece_index)
+        # hold the lock for the whole check + add so two threads cant pick the same piece
+        with self._state_lock:
+            candidates = [
+                i
+                for i in range(self.num_pieces)
+                if not self.has_piece(i)
+                and self.neighbor_has_piece(nbr, i)
+                and i not in self.in_flight_requests
+            ]
+            if not candidates:
+                return
+            piece_index = random.choice(candidates)
+            nbr.requested_piece = piece_index
+            self.in_flight_requests.add(piece_index)
         self.net.send_message(
             remote_id,
             protocol.Message(
@@ -151,7 +178,135 @@ class PeerSession:
             ),
         )
 
-    # ----- message / connection callbacks -----
+    # termination ----
+
+    def _check_termination(self) -> None:
+        # bail early if we dont have everything yet
+        with self._state_lock:
+            if self.count_pieces() < self.num_pieces:
+                return
+        # check every connected neighbor -- if any still missing a piece we're not done
+        for nbr in list(self.neighbors.values()):
+            if not all(self.neighbor_has_piece(nbr, i) for i in range(self.num_pieces)):
+                return
+        self._done_event.set()
+
+    # rate tracking -----
+
+    def _snapshot_rates(self) -> None:
+        # called every unchoke_interval seconds -- capture how many bytes we downloaded
+        # from each neighbor during that window, convert to bytes/sec, then reset the
+        # counter so the next interval starts fresh
+        interval = self.common.unchoke_interval
+        with self._state_lock:
+            for nbr in self.neighbors.values():
+                nbr.download_rate = nbr.bytes_downloaded_from / interval
+                nbr.bytes_downloaded_from = 0
+
+    def _update_preferred_neighbors(self) -> None:
+        k = self.common.num_pref_neighbors
+
+        # only neighbors that are actually interested in getting pieces from us
+        interested = [
+            nbr for nbr in list(self.neighbors.values()) if nbr.peer_interested
+        ]
+
+        with self._state_lock:
+            has_full_file = self.count_pieces() == self.num_pieces
+
+        if has_full_file:
+            # we're a seeder so rates dont matter -- just pick randomly
+            chosen = random.sample(interested, min(k, len(interested)))
+        else:
+            # top-k by download rate, random secondary sort breaks ties
+            chosen = sorted(
+                interested,
+                key=lambda n: (n.download_rate, random.random()),
+                reverse=True,
+            )[:k]
+
+        new_preferred = {nbr.peer_id for nbr in chosen}
+        old_preferred = self.preferred_neighbors
+
+        # choke anyone who dropped out of preferred, unless they're the optimistic pick
+        for pid in old_preferred - new_preferred:
+            if pid == self.optimistic_peer:
+                continue
+            nbr = self.neighbors.get(pid)
+            if nbr and not nbr.am_choking:
+                nbr.am_choking = True
+                self.net.send_message(pid, protocol.Message(protocol.MessageType.CHOKE))
+
+        # unchoke anyone newly added to preferred
+        for pid in new_preferred - old_preferred:
+            nbr = self.neighbors.get(pid)
+            if nbr and nbr.am_choking:
+                nbr.am_choking = False
+                self.net.send_message(
+                    pid, protocol.Message(protocol.MessageType.UNCHOKE)
+                )
+
+        self.preferred_neighbors = new_preferred
+
+        if new_preferred:
+            ids = ",".join(str(pid) for pid in sorted(new_preferred))
+            self.logger.write(
+                f"Peer {self.self_info.peer_id} has the preferred neighbors [{ids}]."
+            )
+
+    def _unchoke_loop(self) -> None:
+        # snapshot rates first so the decision always uses fresh numbers, then pick neighbors
+        while not self.net._shutdown.is_set():
+            time.sleep(self.common.unchoke_interval)
+            self._snapshot_rates()
+            self._update_preferred_neighbors()
+
+    def _update_optimistic_unchoke(self) -> None:
+        # candidates are neighbors we're choking AND who are interested in us
+        # (excludes already-preferred neighbors since they're already unchoked)
+        candidates = [
+            nbr
+            for nbr in list(self.neighbors.values())
+            if nbr.am_choking and nbr.peer_interested
+        ]
+
+        old_optimistic = self.optimistic_peer
+
+        if candidates:
+            new_optimistic = random.choice(candidates).peer_id
+        else:
+            new_optimistic = None
+
+        # choke the previous optimistic pick if they arent in preferred anymore
+        if old_optimistic is not None and old_optimistic != new_optimistic:
+            if old_optimistic not in self.preferred_neighbors:
+                nbr = self.neighbors.get(old_optimistic)
+                if nbr and not nbr.am_choking:
+                    nbr.am_choking = True
+                    self.net.send_message(
+                        old_optimistic, protocol.Message(protocol.MessageType.CHOKE)
+                    )
+
+        # unchoke the new pick
+        if new_optimistic is not None:
+            nbr = self.neighbors.get(new_optimistic)
+            if nbr and nbr.am_choking:
+                nbr.am_choking = False
+                self.net.send_message(
+                    new_optimistic, protocol.Message(protocol.MessageType.UNCHOKE)
+                )
+            self.logger.write(
+                f"Peer {self.self_info.peer_id} has the optimistically unchoked neighbor {new_optimistic}."
+            )
+
+        self.optimistic_peer = new_optimistic
+
+    def _optimistic_loop(self) -> None:
+        while not self.net._shutdown.is_set():
+            time.sleep(self.common.optimistic_interval)
+            self._update_optimistic_unchoke()
+
+    # message / connection callbacks ----
 
     def on_message(self, remote_id: int, message: protocol.Message) -> None:
         nbr = self.neighbors.get(remote_id)
@@ -163,9 +318,10 @@ class PeerSession:
         if mtype == protocol.MessageType.CHOKE:
             # They are now choking us, cancel our in-flight request since no piece is coming
             nbr.peer_choking = True
-            if nbr.requested_piece is not None:
-                self.in_flight_requests.discard(nbr.requested_piece)
-                nbr.requested_piece = None
+            with self._state_lock:
+                if nbr.requested_piece is not None:
+                    self.in_flight_requests.discard(nbr.requested_piece)
+                    nbr.requested_piece = None
             self.logger.write(
                 f"Peer {self.self_info.peer_id} is choked by {remote_id}."
             )
@@ -202,6 +358,7 @@ class PeerSession:
             )
             # They may now have something we want
             self.update_interest(remote_id, nbr)
+            self._check_termination()
 
         elif mtype == protocol.MessageType.BITFIELD:
             # First message after handshake — replace their all-zero placeholder with reality
@@ -209,6 +366,8 @@ class PeerSession:
             nbr.bitfield[:length] = message.payload[:length]
             # Decide if we're interested based on what they have
             self.update_interest(remote_id, nbr)
+            # covers the case where both peers already have the file (no HAVE/PIECE ever fires)
+            self._check_termination()
 
         elif mtype == protocol.MessageType.REQUEST:
             # They want a piece from us — only serve it if we are currently unchoking them
@@ -228,16 +387,16 @@ class PeerSession:
         elif mtype == protocol.MessageType.PIECE:
             piece_index, piece_data = protocol.unpack_piece(message.payload)
 
-            # Request is fulfilled — remove it from in-flight tracking
-            self.in_flight_requests.discard(piece_index)
-            nbr.requested_piece = None
-            nbr.bytes_downloaded_from += len(piece_data)
-
-            # Save the piece to disk and flip our bitfield bit
+            # write to disk first before we tell anyone we have it
             self.write_piece(piece_index, piece_data)
-            self.own_bitfield[piece_index // 8] |= 1 << (7 - (piece_index % 8))
 
-            piece_count = self.count_pieces()
+            # now lock to update the two shared structures together atomically
+            with self._state_lock:
+                self.in_flight_requests.discard(piece_index)
+                nbr.requested_piece = None
+                nbr.bytes_downloaded_from += len(piece_data)
+                self.own_bitfield[piece_index // 8] |= 1 << (7 - (piece_index % 8))
+                piece_count = self.count_pieces()
             self.logger.write(
                 f"Peer {self.self_info.peer_id} has downloaded the piece {piece_index} from {remote_id}. "
                 f"Now the number of pieces it has is {piece_count}."
@@ -251,16 +410,18 @@ class PeerSession:
                 )
             )
 
-            # Check if this was the last piece we needed
+            # check if this was the last piece we needed
             if piece_count == self.num_pieces:
                 self.assemble_file()
                 self.logger.write(
                     f"Peer {self.self_info.peer_id} has downloaded the complete file."
                 )
 
-            # Re-evaluate interest in all neighbors now that our bitfield changed
+            # Reevaluate interest in all neighbors now that our bitfield changed
             for nid, n in list(self.neighbors.items()):
                 self.update_interest(nid, n)
+
+            self._check_termination()
 
             # Keep the pipeline going — ask for the next piece if still unchoked
             if not nbr.peer_choking:
@@ -272,7 +433,7 @@ class PeerSession:
         # The job here is the application-layer setup.
 
         # Register the neighbor with an all-zero bitfield. We don't know which
-        # pieces they have yet; that is filled in when their BITFIELD message arrives.
+        # pieces they have yet; that is filled in when their bitfield message arrives.
         self.neighbors[remote_id] = NeighborState(
             peer_id=remote_id,
             bitfield=bytearray(self.bitfield_len),
@@ -299,7 +460,7 @@ class PeerSession:
                 ),
             )
 
-    # ----- main loop -----
+    # ---- main loop
 
     def run(self) -> None:
         self.net = networking.NetworkManager(
@@ -312,16 +473,19 @@ class PeerSession:
 
         self.net.start_server()
 
+        threading.Thread(target=self._unchoke_loop, daemon=True).start()
+        threading.Thread(target=self._optimistic_loop, daemon=True).start()
+
         # Connect to all peers listed above us in PeerInfo.cfg
         for p in self.peers:
             if p.peer_id == self.self_info.peer_id:
                 break
             self.net.connect_to_peer(p.peer_id, p.host, p.port)
 
-        # Keep the main thread alive so daemon threads stay running
+        # block here until either everyone is done or the user hits ctrl-c
         try:
-            while True:
-                time.sleep(1)
+            self._done_event.wait()
+            self.net.shutdown()
         except KeyboardInterrupt:
             self.net.shutdown()
 
